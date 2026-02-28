@@ -32,6 +32,10 @@ struct NotchMenuView: View {
                 WhatsNewView {
                     self.showWhatsNew = false
                 }
+            } else if self.showLayoutSettings {
+                ModuleLayoutSettingsView(layoutEngine: self.viewModel.layoutEngine) {
+                    self.showLayoutSettings = false
+                }
             } else {
                 ScrollView(.vertical, showsIndicators: true) {
                     VStack(spacing: 4) {
@@ -52,6 +56,13 @@ struct NotchMenuView: View {
                         SoundPickerRow(soundSelector: self.soundSelector)
                         SuppressionPickerRow(suppressionSelector: self.suppressionSelector)
                         ClawdPickerRow(clawdSelector: self.clawdSelector)
+
+                        MenuRow(
+                            icon: "rectangle.split.3x1",
+                            label: "Notch Layout",
+                        ) {
+                            self.showLayoutSettings = true
+                        }
 
                         Divider()
                             .background(Color.white.opacity(0.08))
@@ -181,6 +192,7 @@ struct NotchMenuView: View {
     @State private var launchAtLogin = false
     @State private var hookInstallTask: Task<Void, Never>?
     @State private var showWhatsNew = false
+    @State private var showLayoutSettings = false
     // swiftformat:disable:next wrapAttributes
     @AppStorage("verboseMode")
     private var verboseMode = false
