@@ -225,7 +225,7 @@ typealias PermissionFailureHandler = @Sendable (_ sessionID: String, _ toolUseID
 /// State protected by permissions Mutex
 nonisolated private struct PermissionsState: Sendable {
     var pendingPermissions: [String: PendingPermission] = [:]
-    var respondedPermissions: Set<String> = []
+    var respondedPermissions: [String] = []
 }
 
 // MARK: - CacheState
@@ -364,6 +364,11 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
     nonisolated(unsafe) private var eventHandler: HookEventHandler?
     nonisolated(unsafe) private var permissionFailureHandler: PermissionFailureHandler?
     private let queue = DispatchQueue(label: "com.claudeisland.socket", qos: .userInitiated)
+    private let clientQueue = DispatchQueue(
+        label: "com.engels74.ClaudeIsland.HookSocketServer.client",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
     private let reconnectionManager = SocketReconnectionManager()
 
     /// Explicit stopped state to prevent retries after stop() is called
@@ -528,14 +533,15 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
     /// Mark a permission as responded to prevent duplicate responses
     /// Static helper that operates on state within the Mutex lock
     nonisolated private static func markPermissionResponded(in state: inout PermissionsState, toolUseID: String, maxCount: Int) {
-        state.respondedPermissions.insert(toolUseID)
+        // Maintain uniqueness — skip if already tracked
+        guard !state.respondedPermissions.contains(toolUseID) else { return }
+        state.respondedPermissions.append(toolUseID)
 
-        // Bound the set size to prevent unbounded growth
+        // Bound the array size to prevent unbounded growth
         if state.respondedPermissions.count > maxCount {
-            // Remove oldest entries (arbitrary since Set is unordered, but keeps size bounded)
-            while state.respondedPermissions.count > maxCount / 2 {
-                _ = state.respondedPermissions.removeFirst()
-            }
+            // Remove oldest entries (FIFO — first appended are first removed)
+            let excess = state.respondedPermissions.count - maxCount / 2
+            state.respondedPermissions.removeFirst(excess)
         }
     }
 
@@ -630,10 +636,19 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
         var nosigpipe: Int32 = 1
         setsockopt(clientSocket, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, socklen_t(MemoryLayout<Int32>.size))
 
-        handleClient(clientSocket)
+        // Capture queue-protected handler while on the serial queue.
+        // handleClient runs on clientQueue (concurrent), so reading self.eventHandler
+        // there would race with start/stop which write it on the serial queue.
+        let handler = eventHandler
+
+        // Dispatch client handling off the accept queue to prevent head-of-line blocking.
+        // readClientData polls for up to 200ms — running it here would block new connections.
+        clientQueue.async { [weak self] in
+            self?.handleClient(clientSocket, eventHandler: handler)
+        }
     }
 
-    nonisolated private func handleClient(_ clientSocket: Int32) {
+    nonisolated private func handleClient(_ clientSocket: Int32, eventHandler: HookEventHandler?) {
         let flags = fcntl(clientSocket, F_GETFL)
         _ = fcntl(clientSocket, F_SETFL, flags | O_NONBLOCK)
 
@@ -650,7 +665,7 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
         processEventActions(event)
 
         if event.expectsResponse {
-            handlePermissionRequest(event: event, clientSocket: clientSocket)
+            handlePermissionRequest(event: event, clientSocket: clientSocket, eventHandler: eventHandler)
         } else {
             close(clientSocket)
             eventHandler?(event)
@@ -666,8 +681,8 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
         withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 131_072) { buffer in
             guard let baseAddress = buffer.baseAddress else { return }
 
-            while Date().timeIntervalSince(startTime) < 0.5 {
-                let pollResult = poll(&pollFd, 1, 50)
+            while Date().timeIntervalSince(startTime) < 0.2 {
+                let pollResult = poll(&pollFd, 1, 10)
 
                 if pollResult > 0 && (pollFd.revents & Int16(POLLIN)) != 0 {
                     let bytesRead = read(clientSocket, baseAddress, buffer.count)
@@ -707,7 +722,7 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
         }
     }
 
-    nonisolated private func handlePermissionRequest(event: HookEvent, clientSocket: Int32) {
+    nonisolated private func handlePermissionRequest(event: HookEvent, clientSocket: Int32, eventHandler: HookEventHandler?) {
         guard let toolUseID = resolveToolUseID(for: event) else {
             Self.logger.warning("Permission request missing tool_use_id for \(event.sessionID.prefix(8), privacy: .public) - no cache hit")
             close(clientSocket)
@@ -840,20 +855,32 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
                     "Sending response: \(decision, privacy: .public) for \(pending.sessionID.prefix(8), privacy: .public) tool:\(toolUseID.prefix(12), privacy: .public) (age: \(String(format: "%.1f", age), privacy: .public)s)"
                 )
 
+            var writeSuccess = false
+            var writeErrno: Int32 = 0
             data.withUnsafeBytes { bytes in
                 guard let baseAddress = bytes.baseAddress else {
                     Self.logger.error("Failed to get data buffer address")
                     return
                 }
                 let writeResult = write(pending.clientSocket, baseAddress, data.count)
+                writeErrno = errno
                 if writeResult < 0 {
-                    Self.logger.error("Write failed with errno: \(errno)")
+                    Self.logger.error("Write failed with errno: \(writeErrno)")
                 } else {
                     Self.logger.debug("Write succeeded: \(writeResult) bytes")
+                    writeSuccess = true
                 }
             }
 
-            close(pending.clientSocket)
+            // Skip close if write failed with EBADF — the fd is already invalid
+            // and may have been reused by another thread
+            if writeSuccess || writeErrno != EBADF {
+                close(pending.clientSocket)
+            }
+
+            if !writeSuccess {
+                permissionFailureHandler?(pending.sessionID, toolUseID)
+            }
         }
     }
 
@@ -897,21 +924,27 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
                 )
 
             var writeSuccess = false
+            var writeErrno: Int32 = 0
             data.withUnsafeBytes { bytes in
                 guard let baseAddress = bytes.baseAddress else {
                     Self.logger.error("Failed to get data buffer address")
                     return
                 }
                 let writeResult = write(pending.clientSocket, baseAddress, data.count)
+                writeErrno = errno
                 if writeResult < 0 {
-                    Self.logger.error("Write failed with errno: \(errno)")
+                    Self.logger.error("Write failed with errno: \(writeErrno)")
                 } else {
                     Self.logger.debug("Write succeeded: \(writeResult) bytes")
                     writeSuccess = true
                 }
             }
 
-            close(pending.clientSocket)
+            // Skip close if write failed with EBADF — the fd is already invalid
+            // and may have been reused by another thread
+            if writeSuccess || writeErrno != EBADF {
+                close(pending.clientSocket)
+            }
 
             if !writeSuccess {
                 permissionFailureHandler?(sessionID, pending.toolUseID)
