@@ -304,6 +304,7 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
 
     /// Respond to a pending permission request by toolUseID
     nonisolated func respondToPermission(toolUseID: String, decision: String, reason: String? = nil) {
+        Self.logger.info("respondToPermission called: tool:\(toolUseID.prefix(12), privacy: .public) decision:\(decision, privacy: .public)")
         queue.async { [weak self] in
             self?.sendPermissionResponse(toolUseID: toolUseID, decision: decision, reason: reason)
         }
@@ -562,19 +563,66 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
     }
 
     nonisolated private func cleanupPendingPermissions(sessionID: String) {
-        let permissionsToClose = permissionsState.withLock { state -> [(String, PendingPermission)] in
+        let now = Date()
+        let result = permissionsState.withLock { state -> (toClose: [(String, PendingPermission)], deferred: [(String, TimeInterval)]) in
             let matching = state.pendingPermissions.filter { $0.value.sessionID == sessionID }
-            for (toolUseID, _) in matching {
-                state.pendingPermissions.removeValue(forKey: toolUseID)
+            var toClose: [(String, PendingPermission)] = []
+            var deferred: [(String, TimeInterval)] = []
+            for (toolUseID, pending) in matching {
+                let age = now.timeIntervalSince(pending.receivedAt)
+                if age < 2.0 {
+                    deferred.append((toolUseID, age))
+                    Self.logger.info("Skipping cleanup of recent permission (age: \(String(format: "%.1f", age), privacy: .public)s) for \(sessionID.prefix(8), privacy: .public) tool:\(toolUseID.prefix(12), privacy: .public)")
+                } else {
+                    state.pendingPermissions.removeValue(forKey: toolUseID)
+                    Self.markPermissionResponded(in: &state, toolUseID: toolUseID, maxCount: maxRespondedPermissions)
+                    toClose.append((toolUseID, pending))
+                }
             }
-            return matching.map { ($0.key, $0.value) }
+            return (toClose, deferred)
         }
 
-        for (toolUseID, pending) in permissionsToClose {
+        for (toolUseID, pending) in result.toClose {
             pending.disconnectSource?.cancel()
             Self.logger.debug("Cleaning up stale permission for \(sessionID.prefix(8), privacy: .public) tool:\(toolUseID.prefix(12), privacy: .public)")
             close(pending.clientSocket)
         }
+
+        // Re-schedule cleanup for permissions we skipped above so a cancelled session
+        // doesn't leave the Python hook blocked on its 300s recv timeout.
+        for (toolUseID, age) in result.deferred {
+            let delay = max(2.0 - age, 0.1)
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.cleanupPendingPermissionsRetry(sessionID: sessionID, toolUseID: toolUseID)
+            }
+        }
+    }
+
+    /// Follow-up cleanup for a specific permission whose initial cleanup was skipped
+    /// because it was younger than the 2-second grace window. Idempotent — no-ops if
+    /// the permission has already been resolved or re-scheduled.
+    ///
+    /// Mirrors the main `cleanupPendingPermissions` path: silently closes the FD without
+    /// invoking `permissionFailureHandler`. The phase transition is driven by the Stop
+    /// hook event that triggered this cleanup; firing `permissionSocketFailed` here would
+    /// race with and potentially override that phase (e.g. transition `.idle` back to
+    /// `.waitingForApproval` if another pending tool exists in the chat history).
+    nonisolated private func cleanupPendingPermissionsRetry(sessionID: String, toolUseID: String) {
+        let pending = permissionsState.withLock { state -> PendingPermission? in
+            guard let existing = state.pendingPermissions[toolUseID],
+                  existing.sessionID == sessionID
+            else {
+                return nil
+            }
+            state.pendingPermissions.removeValue(forKey: toolUseID)
+            Self.markPermissionResponded(in: &state, toolUseID: toolUseID, maxCount: maxRespondedPermissions)
+            return existing
+        }
+
+        guard let pending else { return }
+        pending.disconnectSource?.cancel()
+        Self.logger.debug("Deferred cleanup of stale permission for \(sessionID.prefix(8), privacy: .public) tool:\(toolUseID.prefix(12), privacy: .public)")
+        close(pending.clientSocket)
     }
 
     /// Generate cache key from event properties
@@ -659,7 +707,7 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
         let handler = eventHandler
 
         // Dispatch client handling off the accept queue to prevent head-of-line blocking.
-        // readClientData polls for up to 200ms — running it here would block new connections.
+        // readClientData polls for up to 2s — running it here would block new connections.
         clientQueue.async { [weak self] in
             self?.handleClient(clientSocket, eventHandler: handler)
         }
@@ -698,25 +746,61 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
         withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 131_072) { buffer in
             guard let baseAddress = buffer.baseAddress else { return }
 
-            while Date().timeIntervalSince(startTime) < 0.2 {
-                let pollResult = poll(&pollFd, 1, 10)
+            while Date().timeIntervalSince(startTime) < 2.0 {
+                let pollResult = poll(&pollFd, 1, 100)
 
                 if pollResult > 0 && (pollFd.revents & Int16(POLLIN)) != 0 {
                     let bytesRead = read(clientSocket, baseAddress, buffer.count)
                     if bytesRead > 0 {
                         allData.append(baseAddress, count: bytesRead)
-                    } else if bytesRead == 0 || (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        // Break only when the accumulated buffer parses as valid JSON.
+                        // A trailing '}' alone is not sufficient (nested objects end with '}'
+                        // mid-stream), so we validate the full payload. This prevents the
+                        // "Processing…" hang caused by truncating multi-packet JSON.
+                        if Self.looksLikeCompleteJSON(allData) {
+                            break
+                        }
+                    } else if bytesRead == 0 {
+                        // EOF — remote closed, stop reading.
+                        break
+                    } else if errno == EINTR {
+                        // Interrupted by signal — retry (symmetric with poll() EINTR handling).
+                        continue
+                    } else if errno != EAGAIN && errno != EWOULDBLOCK {
+                        // Fatal read error — stop reading.
                         break
                     }
-                } else if pollResult == 0 && !allData.isEmpty {
+                    // bytesRead < 0 with EAGAIN/EWOULDBLOCK: spurious wake, loop and poll again.
+                } else if pollResult > 0 && (pollFd.revents & Int16(POLLHUP | POLLERR | POLLNVAL)) != 0 {
+                    // Peer closed (HUP) or socket error (ERR/NVAL) without readable data —
+                    // break promptly to avoid spinning on an immediately-returning poll().
                     break
-                } else if pollResult != 0 {
+                } else if pollResult < 0 && errno != EINTR {
+                    // Fatal poll error — stop. EINTR is retryable, fall through to loop.
                     break
                 }
+                // pollResult == 0 (quiet period): do NOT break early. Keep waiting up to the
+                // 2s hard cap so multi-packet payloads with small inter-packet gaps are not
+                // truncated. pollResult < 0 with EINTR: retry on next iteration.
             }
         }
 
+        let elapsed = Date().timeIntervalSince(startTime)
+        if elapsed > 0.5 && !allData.isEmpty {
+            Self.logger.info("Slow client read: \(allData.count) bytes in \(String(format: "%.1f", elapsed), privacy: .public)s")
+        }
+
         return allData.isEmpty ? nil : allData
+    }
+
+    /// Cheap check for a complete JSON payload — trailing '}' plus successful decode attempt.
+    /// Returning true here is the only way `readClientData` exits before the 2s hard cap
+    /// (aside from EOF / fatal errors), so it must be strict about completeness.
+    nonisolated private static func looksLikeCompleteJSON(_ data: Data) -> Bool {
+        guard let last = data.last, last == UInt8(ascii: "}") || last == UInt8(ascii: "\n") else {
+            return false
+        }
+        return (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) != nil
     }
 
     nonisolated private func parseHookEvent(from data: Data) -> HookEvent? {
@@ -740,11 +824,12 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
     }
 
     nonisolated private func handlePermissionRequest(event: HookEvent, clientSocket: Int32, eventHandler: HookEventHandler?) {
-        guard let toolUseID = resolveToolUseID(for: event) else {
-            Self.logger.warning("Permission request missing tool_use_id for \(event.sessionID.prefix(8), privacy: .public) - no cache hit")
-            close(clientSocket)
-            eventHandler?(event)
-            return
+        let toolUseID: String
+        if let resolved = resolveToolUseID(for: event) {
+            toolUseID = resolved
+        } else {
+            toolUseID = UUID().uuidString
+            Self.logger.warning("Permission request missing tool_use_id for \(event.sessionID.prefix(8), privacy: .public) - generated fallback: \(toolUseID.prefix(12), privacy: .public)")
         }
 
         Self.logger.debug("Permission request - keeping socket open for \(event.sessionID.prefix(8), privacy: .public) tool:\(toolUseID.prefix(12), privacy: .public)")
@@ -840,8 +925,9 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
         }
 
         guard let pending else { return }
+        let age = Date().timeIntervalSince(pending.receivedAt)
         pending.disconnectSource?.cancel()
-        Self.logger.info("Python socket closed for \(sessionID.prefix(8), privacy: .public) tool:\(toolUseID.prefix(12), privacy: .public) — cleaning up stale permission")
+        Self.logger.warning("Python socket closed for \(sessionID.prefix(8), privacy: .public) tool:\(toolUseID.prefix(12), privacy: .public) after \(String(format: "%.1f", age), privacy: .public)s — cleaning up stale permission")
         close(pending.clientSocket)
         permissionFailureHandler?(sessionID, toolUseID)
     }
@@ -908,10 +994,14 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
 
         switch result {
         case .alreadyResponded:
-            Self.logger.debug("Permission already responded for toolUseId: \(toolUseID.prefix(12), privacy: .public) - skipping duplicate")
+            Self.logger.info("Permission already responded for toolUseId: \(toolUseID.prefix(12), privacy: .public) - skipping duplicate")
             return
         case .notFound:
-            Self.logger.debug("No pending permission for toolUseId: \(toolUseID.prefix(12), privacy: .public)")
+            let pendingCount = permissionsState.withLock { $0.pendingPermissions.count }
+            let pendingIDs = permissionsState.withLock { state in
+                state.pendingPermissions.keys.map { String($0.prefix(12)) }.joined(separator: ", ")
+            }
+            Self.logger.warning("No pending permission for toolUseId: \(toolUseID.prefix(12), privacy: .public) (pending count: \(pendingCount), IDs: [\(pendingIDs, privacy: .public)])")
             return
         case let .found(pending):
             pending.disconnectSource?.cancel()
@@ -928,22 +1018,10 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
                     "Sending response: \(decision, privacy: .public) for \(pending.sessionID.prefix(8), privacy: .public) tool:\(toolUseID.prefix(12), privacy: .public) (age: \(String(format: "%.1f", age), privacy: .public)s)"
                 )
 
-            var writeSuccess = false
-            var writeErrno: Int32 = 0
-            data.withUnsafeBytes { bytes in
-                guard let baseAddress = bytes.baseAddress else {
-                    Self.logger.error("Failed to get data buffer address")
-                    return
-                }
-                let writeResult = write(pending.clientSocket, baseAddress, data.count)
-                writeErrno = errno
-                if writeResult < 0 {
-                    Self.logger.error("Write failed with errno: \(writeErrno)")
-                } else {
-                    Self.logger.debug("Write succeeded: \(writeResult) bytes")
-                    writeSuccess = true
-                }
-            }
+            let writeOutcome = Self.writeAllBytes(fd: pending.clientSocket, data: data)
+            let writeSuccess = writeOutcome.success
+            let writeErrno = writeOutcome.finalErrno
+            Self.logWriteOutcome(writeOutcome, totalBytes: data.count, toolUseID: toolUseID)
 
             // Skip close if write failed with EBADF — the fd is already invalid
             // and may have been reused by another thread
@@ -998,22 +1076,10 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
                     "Sending response: \(decision, privacy: .public) for \(sessionID.prefix(8), privacy: .public) tool:\(pending.toolUseID.prefix(12), privacy: .public) (age: \(String(format: "%.1f", age), privacy: .public)s)"
                 )
 
-            var writeSuccess = false
-            var writeErrno: Int32 = 0
-            data.withUnsafeBytes { bytes in
-                guard let baseAddress = bytes.baseAddress else {
-                    Self.logger.error("Failed to get data buffer address")
-                    return
-                }
-                let writeResult = write(pending.clientSocket, baseAddress, data.count)
-                writeErrno = errno
-                if writeResult < 0 {
-                    Self.logger.error("Write failed with errno: \(writeErrno)")
-                } else {
-                    Self.logger.debug("Write succeeded: \(writeResult) bytes")
-                    writeSuccess = true
-                }
-            }
+            let writeOutcome = Self.writeAllBytes(fd: pending.clientSocket, data: data)
+            let writeSuccess = writeOutcome.success
+            let writeErrno = writeOutcome.finalErrno
+            Self.logWriteOutcome(writeOutcome, totalBytes: data.count, toolUseID: pending.toolUseID)
 
             // Skip close if write failed with EBADF — the fd is already invalid
             // and may have been reused by another thread
@@ -1024,6 +1090,81 @@ final class HookSocketServer: @unchecked Sendable { // swiftlint:disable:this ty
             if !writeSuccess {
                 permissionFailureHandler?(sessionID, pending.toolUseID)
             }
+        }
+    }
+
+    // MARK: - Socket Write Helper
+
+    /// Outcome of a full-payload socket write attempt.
+    nonisolated private struct WriteOutcome: Sendable {
+        let success: Bool
+        let bytesWritten: Int
+        /// Value of `errno` at the point the loop stopped. Zero if success.
+        let finalErrno: Int32
+    }
+
+    /// Write `data` to `fd` in a loop, handling partial writes and retrying on
+    /// `EAGAIN`/`EWOULDBLOCK` (the socket is non-blocking — see `handleClient`).
+    /// Fails only on permanent errors, EOF (write returning 0), or exceeding the
+    /// 2-second cumulative budget.
+    nonisolated private static func writeAllBytes(fd: Int32, data: Data) -> WriteOutcome {
+        let totalBytes = data.count
+        guard totalBytes > 0 else { return WriteOutcome(success: true, bytesWritten: 0, finalErrno: 0) }
+
+        var totalWritten = 0
+        var lastErrno: Int32 = 0
+        let deadline = Date().addingTimeInterval(2.0)
+
+        data.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else {
+                lastErrno = EFAULT
+                return
+            }
+            while totalWritten < totalBytes {
+                let remaining = totalBytes - totalWritten
+                let cursor = baseAddress.advanced(by: totalWritten)
+                let n = write(fd, cursor, remaining)
+                if n > 0 {
+                    totalWritten += n
+                    continue
+                }
+                if n == 0 {
+                    // write() returning 0 on a stream socket is unusual and does not
+                    // set errno meaningfully. Surface an explicit EIO so logs show a
+                    // diagnosable code instead of a stale/zero value.
+                    lastErrno = EIO
+                    break
+                }
+                lastErrno = errno
+                // n < 0
+                if lastErrno == EINTR {
+                    continue
+                }
+                if lastErrno == EAGAIN || lastErrno == EWOULDBLOCK {
+                    if Date() >= deadline { break }
+                    var pollFd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                    // Short poll so we honor the overall deadline without long stalls.
+                    let pollResult = poll(&pollFd, 1, 100)
+                    if pollResult < 0, errno != EINTR { lastErrno = errno; break }
+                    continue
+                }
+                break
+            }
+        }
+
+        let success = totalWritten == totalBytes
+        return WriteOutcome(success: success, bytesWritten: totalWritten, finalErrno: success ? 0 : lastErrno)
+    }
+
+    nonisolated private static func logWriteOutcome(_ outcome: WriteOutcome, totalBytes: Int, toolUseID: String) {
+        if outcome.success {
+            Self.logger.debug("Write succeeded: \(outcome.bytesWritten) bytes")
+        } else if outcome.bytesWritten == 0 {
+            Self.logger.error("Write failed with errno: \(outcome.finalErrno)")
+        } else {
+            Self.logger.error(
+                "Partial write \(outcome.bytesWritten)/\(totalBytes) bytes (errno: \(outcome.finalErrno)) for tool:\(toolUseID.prefix(12), privacy: .public)"
+            )
         }
     }
 }
