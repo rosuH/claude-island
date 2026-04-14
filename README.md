@@ -83,7 +83,7 @@ Subsequent launches require no extra setup. Auto-updates via Sparkle work normal
 If you prefer, you can skip the Gatekeeper steps above by removing the quarantine attribute:
 
 ```bash
-xattr -d com.apple.quarantine "/Applications/Claude Island.app"
+xattr -d com.apple.quarantine "/Applications/Claude Island (Fork).app"
 ```
 
 ### Alternative: Build from Source

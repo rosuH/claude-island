@@ -51,11 +51,11 @@ else
 fi
 
 # Copy app to expected location
-APP_OUTPUT="$BUILD_DIR/DerivedData/Build/Products/Release/Claude Island.app"
+APP_OUTPUT="$BUILD_DIR/DerivedData/Build/Products/Release/Claude Island (Fork).app"
 cp -R "$APP_OUTPUT" "$EXPORT_PATH/"
 
 echo ""
 echo "=== Build Complete ==="
-echo "App exported to: $EXPORT_PATH/Claude Island.app"
+echo "App exported to: $EXPORT_PATH/Claude Island (Fork).app"
 echo ""
 echo "Next: Run ./scripts/create-release.sh --skip-notarization to create DMG"

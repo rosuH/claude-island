@@ -85,7 +85,7 @@ jobs:
         id: version
         run: |
           VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
-            "build/export/Claude Island.app/Contents/Info.plist")
+            "build/export/Claude Island (Fork).app/Contents/Info.plist")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Built version: $VERSION"
 

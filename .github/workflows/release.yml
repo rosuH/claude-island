@@ -147,7 +147,7 @@ jobs:
           fi
 
           # Get minimum system version from Info.plist
-          MIN_SYS=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "build/export/Claude Island.app/Contents/Info.plist" 2>/dev/null || echo "15.6")
+          MIN_SYS=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "build/export/Claude Island (Fork).app/Contents/Info.plist" 2>/dev/null || echo "15.6")
           echo "min_system=$MIN_SYS" >> $GITHUB_OUTPUT
 
       - name: Output build info

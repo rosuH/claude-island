@@ -16,7 +16,7 @@ GITHUB_REPO="engels74/claude-island"
 WEBSITE_DIR="${CLAUDE_ISLAND_WEBSITE:-$PROJECT_DIR/../ClaudeIsland-website}"
 WEBSITE_PUBLIC="$WEBSITE_DIR/public"
 
-APP_PATH="$EXPORT_PATH/Claude Island.app"
+APP_PATH="$EXPORT_PATH/Claude Island (Fork).app"
 APP_NAME="ClaudeIsland"
 KEYCHAIN_PROFILE="ClaudeIsland"
 
@@ -138,9 +138,9 @@ if command -v create-dmg &> /dev/null; then
         --volname "Claude Island" \
         --window-size 600 400 \
         --icon-size 100 \
-        --icon "Claude Island.app" 150 200 \
+        --icon "Claude Island (Fork).app" 150 200 \
         --app-drop-link 450 200 \
-        --hide-extension "Claude Island.app" \
+        --hide-extension "Claude Island (Fork).app" \
         "$DMG_PATH" \
         "$APP_PATH"
 else
@@ -269,7 +269,7 @@ if [ "$SKIP_GITHUB" = false ]; then
 
 **Option 1:** System Settings → Privacy & Security → Click \"Open Anyway\"
 
-**Option 2:** Terminal: \`xattr -d com.apple.quarantine \"/Applications/Claude Island.app\"\`
+**Option 2:** Terminal: \`xattr -d com.apple.quarantine \"/Applications/Claude Island (Fork).app\"\`
 
 ### Auto-updates
 After first launch, auto-updates via Sparkle work normally."
