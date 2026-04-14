@@ -302,8 +302,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.4.4;
-				PRODUCT_BUNDLE_IDENTIFIER = com.engels74.ClaudeIsland;
-				PRODUCT_NAME = "Claude Island";
+				PRODUCT_BUNDLE_IDENTIFIER = me.rosuh.ClaudeIsland;
+				PRODUCT_NAME = "Claude Island (Fork)";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -337,8 +337,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.4.4;
-				PRODUCT_BUNDLE_IDENTIFIER = com.engels74.ClaudeIsland;
-				PRODUCT_NAME = "Claude Island";
+				PRODUCT_BUNDLE_IDENTIFIER = me.rosuh.ClaudeIsland;
+				PRODUCT_NAME = "Claude Island (Fork)";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
